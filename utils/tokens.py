@@ -163,6 +163,14 @@ async def get_token_usd_price(web3, token_address, token_decimals=None, amount=1
     now = time.time()
     token_address = Web3.to_checksum_address(token_address)
 
+    # Routing WETH -> WETH through Uniswap reverts with
+    # "UniswapV2Library: IDENTICAL_ADDRESSES" (bug found during review: this
+    # silently killed USD pricing for the single most common case, since
+    # WETH is almost always token_in for mempool-triggered swaps). WETH's
+    # USD price is just the live ETH/USD price, no routing needed.
+    if token_address == WETH_ADDRESS:
+        return get_eth_usd_price(web3)
+
     if token_address in _token_price_cache and (now - _token_price_time[token_address] < 30):
         return _token_price_cache[token_address]
 

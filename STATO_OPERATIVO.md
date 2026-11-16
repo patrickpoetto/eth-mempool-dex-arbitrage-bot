@@ -25,11 +25,11 @@
 
 ## ⚠️ **Problemi Critici Operativi**
 
-### 🔴 **1. BUG CRITICO: Calcolo Profitto Errato**
-**Problema**: Il calcolo del profitto è **completamente sbagliato**.
+### ✅ **1. [RISOLTO in review] Calcolo Profitto Errato**
+**Problema originale**: Il calcolo del profitto era **completamente sbagliato**.
 
 ```python
-# utils/arbitrage.py linea 17-35
+# utils/arbitrage.py linea 17-35 (VECCHIO CODICE)
 profit_tokens = adjusted_out - amount_in  # ❌ Confronta token diversi!
 profit_eth = float(Web3.from_wei(profit_tokens, 'ether'))  # ❌ Assume ETH
 profit_usd = profit_eth * eth_usd_price  # ❌ Calcolo errato
@@ -39,21 +39,35 @@ profit_usd = profit_eth * eth_usd_price  # ❌ Calcolo errato
 - `Net profit: $340911005.52` ❌ (impossibile)
 - `Net profit: $551474339809767.12` ❌ (assurdo)
 
-**Causa**: 
-- Confronta `amount_in` (token A) con `adjusted_out` (token B) - sono token diversi!
-- Non converte i token in USD prima di calcolare il profitto
-- Assume che `profit_tokens` sia in ETH quando è in token OUT
+**Causa esatta** (diagnosticata e riprodotta durante la review con quote live
+da mainnet, 1 WETH vs ~1812 USDC):
+- `amount_in` è nei decimali nativi del token A (es. 18 per WETH), mai
+  normalizzato.
+- `adjusted_out` è il quote del token B già forzato a 18-decimali "finti" da
+  `normalize_to_18_decimals` (utile per confrontare DEX diversi sullo stesso
+  token_out, ma non è un importo in ETH).
+- La sottrazione tra i due mischia asset diversi E scale diverse; il
+  risultato viene poi diviso per 1e18 come se fosse wei di ETH e moltiplicato
+  per il prezzo ETH/USD. Siccome 1 USDC usa ~1e12 volte meno unità raw di
+  1 ETH per lo stesso valore in dollari, il padding a 18 decimali gonfia il
+  numero di un fattore enorme prima ancora di moltiplicarlo per il prezzo
+  ETH/USD. Riprodotto: la vecchia funzione riportava **$3,267,091.34** di
+  "profitto" su uno scambio che in realtà vale circa **-$19.53** (gas +
+  slippage).
 
-**Impatto**: **CRITICO** - Il bot segnala opportunità false, profitti irrealistici
+**Fix applicato**: `is_profitable_arbitrage` ora riceve direttamente i due
+importi già convertiti in USD (via `utils.tokens.get_token_usd_price`, che
+instrada il token su Uniswap V2 verso WETH e usa il feed Chainlink ETH/USD
+live) e fa un confronto USD-vs-USD. Durante il fix è emerso anche un secondo
+bug reale: `get_token_usd_price` instradava WETH su se stesso
+(`[WETH, WETH]`), causando un revert `IDENTICAL_ADDRESSES` e azzerando
+silenziosamente il prezzo USD nel caso più comune (WETH come token_in).
+Anche questo è stato corretto.
 
-**Fix Necessario**: 
-```python
-# Deve:
-# 1. Convertire amount_in (token A) → USD
-# 2. Convertire adjusted_out (token B) → USD  
-# 3. Calcolare profitto in USD
-# 4. Sottrarre gas cost in USD
-```
+**Limite residuo**: il confronto resta "miglior quote vs peggior quote per
+una singola direzione di swap", non un vero arbitraggio a due gambe con
+rientro nel token di partenza — quindi un "net profit" positivo qui è un
+segnale necessario ma non sufficiente di una vera opportunità.
 
 ---
 
@@ -134,8 +148,8 @@ profit_usd = profit_eth * eth_usd_price  # ❌ Calcolo errato
 
 | Componente | Stato | Note |
 |-----------|-------|------|
-| **Core Functionality** | ✅ | Funziona, ma con bug critico |
-| **Bug Fixes** | ❌ | Calcolo profitto da correggere |
+| **Core Functionality** | ✅ | Funziona, bug profitto risolto in review |
+| **Bug Fixes** | ✅ | Calcolo profitto corretto (confronto USD-vs-USD) |
 | **Error Handling** | ✅ | Buono, provider health tracking |
 | **Logging** | ❌ | Solo console, no file |
 | **Monitoring** | ❌ | Nessun sistema |
@@ -189,19 +203,22 @@ profit_usd = profit_eth * eth_usd_price  # ❌ Calcolo errato
 
 ---
 
-## 📊 **Stato Attuale: 60% Pronto**
+## 📊 **Stato Attuale: 65% Pronto**
 
 **Funziona**:
 - ✅ Monitoraggio mempool
 - ✅ Decodifica transazioni
 - ✅ Quote DEX
 - ✅ Provider management
+- ✅ Calcolo profitto in USD consistente (dopo il fix di review; resta
+  comunque un confronto a una gamba, non un round-trip verificato)
 
 **Non Funziona**:
-- ❌ Calcolo profitto corretto
 - ❌ Esecuzione reale
 - ❌ Logging persistente
 - ❌ Monitoraggio
+- ❌ Simulazione con wallet realmente fondato (eth_call usa sempre
+  address(0) come mittente)
 
 **Conclusione**: Il bot è **funzionalmente completo** ma ha un **bug critico** nel calcolo del profitto che lo rende **non affidabile** per decisioni operative. Una volta fixato il bug, è utilizzabile per monitoraggio e simulazione, ma non per esecuzione reale senza ulteriori sviluppi.
 

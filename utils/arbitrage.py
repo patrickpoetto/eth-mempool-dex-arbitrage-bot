@@ -9,29 +9,51 @@ from utils.dex import (
     normalize_to_18_decimals, ROUTER_ABI
     )
 from config import ARBITRAGE_ADDRESS, ROUTERS, get_rotating_http_provider, get_eth_usd_price
-from decimal import Decimal
 import time
 
 _SEEN_DEX_QUOTES = set()
 
-def is_profitable_arbitrage(amount_in, amount_out_a, amount_out_b, eth_usd_price, slippage=0.005, gas_price_gwei=30, gas_limit=200_000, min_profit_usd=10):
-    amount_in = float(amount_in)
-    amount_out_a = float(amount_out_a)
-    amount_out_b = float(amount_out_b)
-    eth_usd_price = float(eth_usd_price)
+def is_profitable_arbitrage(amount_in_usd, amount_out_usd, eth_usd_price, slippage=0.005, gas_price_gwei=30, gas_limit=200_000, min_profit_usd=10):
+    """
+    Compare the USD value of what goes in vs. what comes out of a candidate
+    arbitrage leg, net of estimated gas.
 
-    better_out = max(amount_out_a, amount_out_b)
-    adjusted_out = better_out * (1 - slippage)
-    profit_tokens = adjusted_out - amount_in
-    if profit_tokens <= 0:
+    HISTORICAL BUG (see README "Known limitations" / STATO_OPERATIVO.md):
+    this function used to take `amount_in` and `amount_out` as raw on-chain
+    integers for two DIFFERENT tokens (token_in's native-decimals amount,
+    and token_out's amount padded to a pretend-18-decimals basis via
+    normalize_to_18_decimals), subtract them directly, then feed that
+    mixed-asset/mixed-scale difference through `Web3.from_wei(x, 'ether')`
+    as if it were a literal wei-of-ETH quantity, and multiply by the
+    ETH/USD price. Concretely: normalize_to_18_decimals(usdc_raw, 6) pads a
+    USDC integer by 1e12 so it can be compared to other DEX quotes for the
+    same token_out - that's fine for THAT comparison - but is_profitable_
+    arbitrage then re-interpreted that padded USDC integer as ETH wei and
+    priced it at the ETH/USD rate. Since 1 USDC needs ~1e12x fewer raw
+    units than 1 ETH to represent the same ~$1-$2000 of value, this
+    manufactured a bogus ~1e12x-scale number before even multiplying by
+    the ETH/USD price, which is exactly how trivial trades produced
+    "net profit: $340,911,005.52"-style nonsense.
+
+    FIX: both sides are now converted to actual USD (via
+    utils.tokens.get_token_usd_price, which prices a token through its
+    Uniswap V2 WETH route and the live ETH/USD Chainlink feed) by the
+    caller before this function ever sees them, so the comparison here is
+    a plain USD-vs-USD subtraction. This does NOT turn the bot into a real
+    arbitrage engine - it's still a single-leg "best quote vs. worst quote"
+    comparison, not a verified round-trip - see README for that caveat.
+    """
+    if amount_in_usd is None or amount_out_usd is None:
         return False, 0
+
+    amount_in_usd = float(amount_in_usd)
+    amount_out_usd = float(amount_out_usd) * (1 - slippage)
+    eth_usd_price = float(eth_usd_price)
 
     gas_cost_eth = float(Web3.from_wei(gas_price_gwei * gas_limit * 10**9, 'ether'))
     gas_cost_usd = gas_cost_eth * eth_usd_price
-    profit_eth = float(Web3.from_wei(profit_tokens, 'ether'))
-    profit_usd = profit_eth * eth_usd_price
 
-    net_profit = profit_usd - gas_cost_usd
+    net_profit = amount_out_usd - amount_in_usd - gas_cost_usd
     return net_profit > min_profit_usd, net_profit
 
 seen_pairs = set()
@@ -50,6 +72,7 @@ async def check_arbitrage_opportunity(web3, amount_in, path, eth_usd_price, dire
         return
     _SEEN_DEX_QUOTES.add(label_key)
 
+    token_in_decimals = await get_token_decimals_cached(web3, token_in)
     token_out_decimals = await get_token_decimals_cached(web3, token_out)
     token_in_symbol = await get_token_symbol_async(web3, token_in)
     token_out_symbol = await get_token_symbol_async(web3, token_out)
@@ -93,18 +116,27 @@ async def check_arbitrage_opportunity(web3, amount_in, path, eth_usd_price, dire
     out_best = quotes[best_dex]
     out_worst = quotes[worst_dex]
 
-    is_prof, net_profit = is_profitable_arbitrage(amount_in, out_best, out_worst, eth_usd_price)
+    # Both quotes were normalized to a pretend-18-decimals basis already
+    # (utils.dex.normalize_to_18_decimals), so dividing by 1e18 recovers the
+    # human-readable amount of token_out regardless of its real decimals.
+    output_token = Web3.from_wei(out_best, 'ether')
+
+    try:
+        token_in_usd_price = await get_token_usd_price(web3, token_in, token_in_decimals)
+        token_usd_price = await get_token_usd_price(web3, token_out, token_out_decimals)
+    except Exception as e:
+        print(f"[WARN] USD price lookup failed: {e}")
+        token_in_usd_price = None
+        token_usd_price = None
+
+    amount_in_human = float(amount_in) / (10 ** token_in_decimals)
+    amount_in_usd = amount_in_human * token_in_usd_price if token_in_usd_price else None
+    amount_out_usd = float(output_token) * token_usd_price if token_usd_price else None
+
+    is_prof, net_profit = is_profitable_arbitrage(amount_in_usd, amount_out_usd, eth_usd_price)
 
     if is_prof:
-        output_token = Web3.from_wei(out_best, 'ether')
-
-        try:
-            token_usd_price = await get_token_usd_price(web3, token_out, token_out_decimals)
-            usd_val = output_token * token_usd_price if token_usd_price else None
-            usd_str = f"${usd_val:.2f}" if usd_val else "≈ N/A"
-        except Exception as e:
-            print(f"[WARN] USD price lookup failed: {e}")
-            usd_str = "≈ N/A"
+        usd_str = f"${amount_out_usd:.2f}" if amount_out_usd else "≈ N/A"
 
         print(f"[💸 ARBITRAGGIO] {'Copy' if direction == 'forward' else 'Invert'} | Buy on {worst_dex}, Sell on {best_dex} | Net profit: ${net_profit:.2f}")
         print(f"→ Output: {output_token:.6f} {token_out_symbol} ≈ {usd_str}")
